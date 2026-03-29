@@ -9,36 +9,57 @@ import time
 
 
 def generate_sparse_input(batch_size, channels, height, width, sparsity, device):
-    #Generate a sparse input tensor simulating event-based camera data.
-    #Non-zero pixels represent brightness-change events. The sparsity parameter controls the fraction of elements that are zero (e.g. 0.95 means 95% zeros).
+    # Generate a sparse input tensor simulating event-based camera data.
+    # Non-zero pixels represent brightness-change events. The sparsity parameter controls the fraction of elements that are zero (e.g. 0.95 means 95% zeros).
     dense = torch.randn(batch_size, channels, height, width, device=device)
     mask = (torch.rand(batch_size, channels, height, width, device=device) >= sparsity).float()
     return dense * mask
 
 
 def valid_subconv_detection(input_tensor, kernel_height, kernel_width, stride):
-    #Stage 1: Identify sliding-window positions that contain at least one non-zero element across all input channels.
-    #Returns a list of (row, col) tuples for each batch element indicating the valid output positions.
-
+    # Stage 1: Identify valid sub-convolution positions using active pixel locations (Valid_pix), following Zhang et al. Section 3.2
+    # Returns a list of (row, col) tensors per batch element and the output spatial dimensions.
     batch_size, channels, height, width = input_tensor.shape
     out_h = (height - kernel_height) // stride + 1
     out_w = (width - kernel_width) // stride + 1
-
-    # Build a binary activity map: 1 where any channel is non-zero
-    activity = (input_tensor.abs().sum(dim=1, keepdim=True) > 0).float()
-
-    # Use max-pool to check if each window contains at least one active pixel
-    window_activity = torch.nn.functional.max_pool2d(
-        activity,
-        kernel_size=(kernel_height, kernel_width),
-        stride=stride,
-    )
-
+ 
     valid_positions = []
     for b in range(batch_size):
-        positions = torch.nonzero(window_activity[b, 0], as_tuple=False)
+        # Collect Valid_pix: spatial positions where any channel is non-zero
+        active_mask = input_tensor[b].abs().sum(dim=0) > 0  # (H, W)
+        active_coords = torch.nonzero(active_mask, as_tuple=False)  # (N, 2)
+ 
+        if active_coords.shape[0] == 0:
+            valid_positions.append(
+                torch.zeros(0, 2, dtype=torch.long, device=input_tensor.device)
+            )
+            continue
+ 
+        # For each active pixel (r, c), compute the range of output window
+        # positions (oh, ow) whose receptive field includes that pixel.
+        #   oh_min = ceil(max(0, r - kH + 1) / stride)
+        #   oh_max = floor(min(r, (out_h - 1) * stride) / stride)
+        # Same logic for the width axis.
+        r = active_coords[:, 0]
+        c = active_coords[:, 1]
+ 
+        oh_min = torch.clamp((r - kernel_height + 1).float().div(stride).ceil().long(), min=0)
+        oh_max = torch.clamp(r // stride, max=out_h - 1)
+        ow_min = torch.clamp((c - kernel_width + 1).float().div(stride).ceil().long(), min=0)
+        ow_max = torch.clamp(c // stride, max=out_w - 1)
+ 
+        # Expand each active pixel into all output positions it maps to and
+        # collect the union via a flat boolean mask.
+        valid_mask = torch.zeros(out_h, out_w, dtype=torch.bool,
+                                 device=input_tensor.device)
+        for idx in range(active_coords.shape[0]):
+            if oh_min[idx] <= oh_max[idx] and ow_min[idx] <= ow_max[idx]:
+                valid_mask[oh_min[idx]:oh_max[idx] + 1,
+                           ow_min[idx]:ow_max[idx] + 1] = True
+ 
+        positions = torch.nonzero(valid_mask, as_tuple=False)
         valid_positions.append(positions)
-
+ 
     return valid_positions, out_h, out_w
 
 
