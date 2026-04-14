@@ -27,7 +27,7 @@ CPU and GPU have been used as baselines.
 * The number of valid sub-convolutions, total execution time for both sparse and dense paths in ms, and the speedup ratio are printed at the end. Command-line arguments specify the device, and cpu is chosen as the default device. If the device is specified as cuda, and cuda is not available, cpu is chosen as the fallback option.
 
 ### PIM Implementation
-The PIM variant is implemented using C++. The C++ implementation includes the full three-stage CPU sparse convolution pipeline for baseline profiling and verification, with PIM kernel integration in progress.
+The PIM variant is implemented using C++. The C++ implementation includes the full three-stage CPU sparse convolution pipeline for baseline profiling and verification.
 
 ## Compilation and Execution Instructions for Specific Variants
 
