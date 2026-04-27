@@ -520,8 +520,15 @@ int main(int argc, char *argv[])
   cout << "  Input sparse optimization:    " << (params.useInputSparseOpt  ? "ON" : "OFF") << endl;
 
   // -------------------------------------------------------------------------
+  // Timing accumulators (host-side only; PIM device time is in pimShowStats)
+  // -------------------------------------------------------------------------
+  using ms = chrono::duration<double, milli>;
+  ms timeDataGen(0), timeActivePosComp(0), timeIm2col(0), timeResultStore(0);
+
+  // -------------------------------------------------------------------------
   // Generate input and kernel matrices
   // -------------------------------------------------------------------------
+  auto t0 = chrono::steady_clock::now();
   Image3D inputMatrix(params.dim);
   for (uint64_t i = 0; i < params.dim; i++) {
     getMatrix(params.row, params.column, params.padding, inputMatrix[i]);
@@ -533,6 +540,7 @@ int main(int argc, char *argv[])
     getMatrix(params.kernelHeight, params.kernelWidth, 0, mat);
     applyKernelSparsity(params.kernelSparsity, mat);
   }
+  timeDataGen += chrono::steady_clock::now() - t0;
 
   // Report actual measured sparsity after injection
   {
@@ -604,8 +612,10 @@ int main(int argc, char *argv[])
   int activeCount = outMatRow * outMatCol; // default: all positions active (dense)
 
   if (params.useInputSparseOpt) {
+    auto t_ap = chrono::steady_clock::now();
     computeActiveOutputPositions(inputMatrix, kernelH, kernelW, params.stride,
                                  outMatRow, outMatCol, activePositions);
+    timeActivePosComp += chrono::steady_clock::now() - t_ap;
     activeCount = activePositions.size();
 
     double activeFrac = (outMatRow * outMatCol > 0)
@@ -627,11 +637,23 @@ int main(int argc, char *argv[])
   int effectiveHopSize   = params.useInputSparseOpt ? activeCount          : outMatRow * outMatCol;
 
   // -------------------------------------------------------------------------
+  // Early exit: if all input activations are zero, the output is trivially zero
+  // -------------------------------------------------------------------------
+  if (params.useInputSparseOpt && activeCount == 0) {
+    cout << "  All input activations are zero; skipping PIM execution." << endl;
+    Image3D resultMatrix(outMatDim,
+        vector<vector<int>>(outMatRow, vector<int>(outMatCol, 0)));
+    if (params.shouldVerify) {
+      VerifyWithCPU(inputMatrix, kernelMatrix, params.padding, params.stride,
+                    params.moreDebugPrints, resultMatrix);
+    }
+    pimShowStats();
+    return 0;
+  }
+
+  // -------------------------------------------------------------------------
   // Main convolution loop: one iteration per output filter
   // -------------------------------------------------------------------------
-  chrono::duration<double, milli> hostElapsedTime =
-      chrono::duration<double, milli>::zero();
-
   Image3D resultMatrix(outMatDim,
       vector<vector<int>>(outMatRow, vector<int>(outMatCol, 0)));
 
@@ -650,6 +672,7 @@ int main(int argc, char *argv[])
       // Channels are interleaved horizontally: merged[filterPos] = [ch_j | ch_{j+1} | ...].
       vector<vector<int>> mergedMat(numOfPIMRow);
 
+      auto t_im2col = chrono::steady_clock::now();
       for (uint64_t ch = j; ch < matChunk; ch++) {
         if (params.useInputSparseOpt) {
           // Input sparsity path: only include active output positions
@@ -675,6 +698,7 @@ int main(int argc, char *argv[])
           }
         }
       }
+      timeIm2col += chrono::steady_clock::now() - t_im2col;
 
       if (params.moreDebugPrints) {
         cout << "Filter " << filterIdx << ", chunk ch=[" << j << "," << matChunk << "): "
@@ -696,6 +720,7 @@ int main(int argc, char *argv[])
     aggregate(outVector, dstVec, effectiveHopSize);
 
     // Store results into the output tensor.
+    auto t_store = chrono::steady_clock::now();
     if (params.useInputSparseOpt) {
       // Input sparsity path: scatter compressed results to full output positions.
       // Positions not in activePositions were never touched and remain zero.
@@ -714,6 +739,7 @@ int main(int argc, char *argv[])
         }
       }
     }
+    timeResultStore += chrono::steady_clock::now() - t_store;
 
     if (params.moreDebugPrints) {
       cout << "Filter " << filterIdx << " result:" << endl;
@@ -734,8 +760,17 @@ int main(int argc, char *argv[])
   // Stats
   // -------------------------------------------------------------------------
   pimShowStats();
-  cout << "Host elapsed time: " << fixed << setprecision(3)
-       << hostElapsedTime.count() << " ms." << endl;
+
+  double totalCPUMs = timeDataGen.count() + timeActivePosComp.count() +
+                      timeIm2col.count()  + timeResultStore.count();
+  cout << fixed << setprecision(3);
+  cout << "\nCPU overhead breakdown:" << endl;
+  cout << "  Data generation:              " << timeDataGen.count()       << " ms" << endl;
+  if (params.useInputSparseOpt)
+    cout << "  Active position computation:  " << timeActivePosComp.count() << " ms" << endl;
+  cout << "  im2col decomposition:         " << timeIm2col.count()        << " ms" << endl;
+  cout << "  Result store/scatter:         " << timeResultStore.count()   << " ms" << endl;
+  cout << "  Total CPU overhead:           " << totalCPUMs               << " ms" << endl;
 
   return 0;
 }
